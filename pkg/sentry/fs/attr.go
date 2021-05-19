@@ -478,6 +478,17 @@ func (f FilePermissions) AnyRead() bool {
 	return f.User.Read || f.Group.Read || f.Other.Read
 }
 
+func (f FilePermissions) HasSetUIDOrGID() bool {
+	return f.SetUID || f.SetGID
+}
+
+func (f *FilePermissions) DropSetUIDAndMaybeGID() {
+	f.SetUID = false
+	if f.Group.Execute {
+		f.SetGID = false
+	}
+}
+
 // FileOwner represents ownership of a file.
 //
 // +stateify savable
