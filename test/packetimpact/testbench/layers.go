@@ -954,8 +954,8 @@ func (l *ICMPv4) ToBytes() ([]byte, error) {
 	if l.Code != nil {
 		h.SetCode(*l.Code)
 	}
-	if copied := copy(h.Payload(), l.Payload); copied != len(l.Payload) {
-		panic(fmt.Sprintf("wrong number of bytes copied into h.Payload(): got = %d, want = %d", len(h.Payload()), len(l.Payload)))
+	if n := copy(h.Payload(), l.Payload); n != len(l.Payload) {
+		panic(fmt.Sprintf("wrong number of bytes copied into h.Payload(): got = %d, want = %d", n, len(l.Payload)))
 	}
 	typ := h.Type()
 	switch typ {
@@ -977,16 +977,7 @@ func (l *ICMPv4) ToBytes() ([]byte, error) {
 	if l.Checksum != nil {
 		h.SetChecksum(*l.Checksum)
 	} else {
-		// Compute the checksum based on the ICMPv4.Payload and also the subsequent
-		// layers.
-		payload, err := payload(l)
-		if err != nil {
-			return nil, err
-		}
-		var vv buffer.VectorisedView
-		vv.AppendView(buffer.View(l.Payload))
-		vv.Append(payload)
-		h.SetChecksum(header.ICMPv4Checksum(h, header.ChecksumVV(vv, 0 /* initial */)))
+		h.SetChecksum(^header.Checksum(h, 0))
 	}
 
 	return h, nil
@@ -1019,7 +1010,7 @@ func (l *ICMPv4) match(other Layer) bool {
 }
 
 func (l *ICMPv4) length() int {
-	return header.ICMPv4MinimumSize
+	return header.ICMPv4MinimumSize + len(l.Payload)
 }
 
 // merge overrides the values in l with the values from other but only in fields
