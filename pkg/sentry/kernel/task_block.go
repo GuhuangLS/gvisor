@@ -166,6 +166,14 @@ func (t *Task) block(C <-chan struct{}, timerChan <-chan struct{}) error {
 	}
 }
 
+func (t *Task) TaskStartRegion() *trace.Region {
+	return trace.StartRegion(t.traceContext, blockRegion)
+}
+
+func (t *Task) TaskEndRegion(region *trace.Region) {
+		region.End()
+}
+
 // SleepStart implements context.ChannelSleeper.SleepStart.
 func (t *Task) SleepStart() <-chan struct{} {
 	t.assertTaskGoroutine()
@@ -240,6 +248,11 @@ func (t *Task) interrupt() {
 func (t *Task) interruptSelf() {
 	select {
 	case t.interruptChan <- struct{}{}:
+		w := t.FutexWaiter()
+		if w.Forever && t.Futex().KeyMatch(w) {
+			w.Interrupt = true
+			runtime.WakeG(w.G)
+		}
 	default:
 	}
 	// platform.Context.Interrupt() is unnecessary since a task goroutine

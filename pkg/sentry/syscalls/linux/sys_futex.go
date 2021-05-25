@@ -15,6 +15,7 @@
 package linux
 
 import (
+	"runtime"
 	"time"
 
 	"gvisor.dev/gvisor/pkg/abi/linux"
@@ -53,13 +54,29 @@ func (f *futexWaitRestartBlock) Restart(t *kernel.Task) (uintptr, error) {
 // arguments.
 func futexWaitAbsolute(t *kernel.Task, clockRealtime bool, ts linux.Timespec, forever bool, addr hostarch.Addr, private bool, val, mask uint32) (uintptr, error) {
 	w := t.FutexWaiter()
-	err := t.Futex().WaitPrepare(w, t, addr, private, val, mask)
+	if w.G == 0 {
+		w.G = runtime.GetG()
+	}
+	err := t.Futex().WaitPrepare(w, t, addr, private, val, mask, forever)
 	if err != nil {
+		w.Forever = false
 		return 0, err
 	}
 
 	if forever {
-		err = t.Block(w.C)
+		if private && w.Forever {
+			t.SleepStart()
+			region := t.TaskStartRegion()
+			runtime.BlockG()
+			if w.Interrupt == true {
+				w.Interrupt = false
+				err = syserror.ErrInterrupted
+			}
+			t.TaskEndRegion(region)
+			t.SleepFinish(true)
+		} else {
+			err = t.Block(w.C)
+		}
 	} else if clockRealtime {
 		notifier, tchan := ktime.NewChannelNotifier()
 		timer := ktime.NewTimer(t.Kernel().RealtimeClock(), notifier)
@@ -73,7 +90,10 @@ func futexWaitAbsolute(t *kernel.Task, clockRealtime bool, ts linux.Timespec, fo
 		err = t.BlockWithDeadline(w.C, true, ktime.FromTimespec(ts))
 	}
 
-	t.Futex().WaitComplete(w, t)
+	if !forever || !private || err != nil {
+		t.Futex().WaitComplete(w)
+	}
+	w.Forever = false
 	return 0, syserror.ConvertIntr(err, syserror.ERESTARTSYS)
 }
 
@@ -89,13 +109,33 @@ func futexWaitAbsolute(t *kernel.Task, clockRealtime bool, ts linux.Timespec, fo
 // syscall is restarted with the remaining timeout.
 func futexWaitDuration(t *kernel.Task, duration time.Duration, forever bool, addr hostarch.Addr, private bool, val, mask uint32) (uintptr, error) {
 	w := t.FutexWaiter()
-	err := t.Futex().WaitPrepare(w, t, addr, private, val, mask)
+	if w.G == 0 {
+		w.G = runtime.GetG()
+	}
+	err := t.Futex().WaitPrepare(w, t, addr, private, val, mask, forever)
 	if err != nil {
+		w.Forever = false
 		return 0, err
 	}
 
-	remaining, err := t.BlockWithTimeout(w.C, !forever, duration)
-	t.Futex().WaitComplete(w, t)
+	var remaining time.Duration
+	if private && forever {
+		t.SleepStart()
+		region := t.TaskStartRegion()
+		runtime.BlockG()
+		if w.Interrupt == true {
+			w.Interrupt = false
+			err = syserror.ErrInterrupted
+		}
+		t.TaskEndRegion(region)
+		t.SleepFinish(true)
+	} else {
+		remaining, err = t.BlockWithTimeout(w.C, !forever, duration)
+	}
+	if !forever || !private || err != nil {
+		t.Futex().WaitComplete(w)
+	}
+	w.Forever = false
 	if err == nil {
 		return 0, nil
 	}
@@ -126,6 +166,7 @@ func futexWaitDuration(t *kernel.Task, duration time.Duration, forever bool, add
 
 func futexLockPI(t *kernel.Task, ts linux.Timespec, forever bool, addr hostarch.Addr, private bool) error {
 	w := t.FutexWaiter()
+	w.Forever = false
 	locked, err := t.Futex().LockPI(w, t, addr, uint32(t.ThreadID()), private, false)
 	if err != nil {
 		return err
@@ -154,6 +195,7 @@ func futexLockPI(t *kernel.Task, ts linux.Timespec, forever bool, addr hostarch.
 
 func tryLockPI(t *kernel.Task, addr hostarch.Addr, private bool) error {
 	w := t.FutexWaiter()
+	w.Forever = false
 	locked, err := t.Futex().LockPI(w, t, addr, uint32(t.ThreadID()), private, true)
 	if err != nil {
 		return err

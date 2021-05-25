@@ -75,7 +75,8 @@ func futexKind(private bool) string {
 
 func newPreparedTestWaiter(t *testing.T, m *Manager, ta Target, addr hostarch.Addr, private bool, val uint32, bitmask uint32) *Waiter {
 	w := NewWaiter()
-	if err := m.WaitPrepare(w, ta, addr, private, val, bitmask); err != nil {
+	w.G = runtime.GetG()
+	if err := m.WaitPrepare(w, ta, addr, private, val, bitmask, true); err != nil {
 		t.Fatalf("WaitPrepare failed: %v", err)
 	}
 	return w
@@ -487,7 +488,8 @@ func (t *testMutex) Lock() {
 
 		// Wait for it to be "not locked".
 		w := NewWaiter()
-		err := t.m.WaitPrepare(w, t.d, t.a, true, testMutexLocked, ^uint32(0))
+		w.G = runtime.GetG()
+		err := t.m.WaitPrepare(w, t.d, t.a, true, testMutexLocked, ^uint32(0), true)
 		if err == unix.EAGAIN {
 			continue
 		}
@@ -495,7 +497,7 @@ func (t *testMutex) Lock() {
 			// Should never happen.
 			panic("WaitPrepare returned unexpected error: " + err.Error())
 		}
-		<-w.C
+		runtime.BlockG()
 		t.m.WaitComplete(w, t.d)
 	}
 }

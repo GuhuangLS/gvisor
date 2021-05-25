@@ -18,6 +18,8 @@
 package futex
 
 import (
+	"runtime"
+
 	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/context"
 	"gvisor.dev/gvisor/pkg/hostarch"
@@ -233,6 +235,18 @@ type Waiter struct {
 
 	// tid is the thread ID for the waiter in case this is a PI mutex.
 	tid uint32
+
+	// G is the go routine of the waiter.
+	G uintptr
+
+	// Forever is the select of the waiter: forever or timeout.
+	Forever bool
+
+	// Interrupt informs task/G waked by interrupt.
+	Interrupt bool
+
+	// Woken for test.
+	Woken     bool
 }
 
 // NewWaiter returns a new unqueued Waiter.
@@ -244,7 +258,7 @@ func NewWaiter() *Waiter {
 
 // woken returns true if w has been woken since the last call to WaitPrepare.
 func (w *Waiter) woken() bool {
-	return len(w.C) != 0
+	return len(w.C) != 0 || w.Woken
 }
 
 // bucket holds a list of waiters for a given address hash.
@@ -273,16 +287,23 @@ func (b *bucket) wakeLocked(key *Key, bitmask uint32, n int) int {
 		// Remove from the bucket and wake the waiter.
 		woke := w
 		w = w.Next() // Next iteration.
-		b.wakeWaiterLocked(woke)
+		b.wakeWaiterLocked(woke, key.Kind)
+		woke.Woken = true
 		done++
 	}
 	return done
 }
 
-func (b *bucket) wakeWaiterLocked(w *Waiter) {
+func (b *bucket) wakeWaiterLocked(w *Waiter, kind KeyKind) {
 	// Remove from the bucket and wake the waiter.
 	b.waiters.Remove(w)
-	w.C <- struct{}{}
+
+	if kind == KindPrivate && w.Forever && w.key.Kind == KindPrivate {
+		w.Interrupt = false
+		runtime.WakeG(w.G)
+	} else {
+		w.C <- struct{}{}
+	}
 
 	// NOTE: The above channel write establishes a write barrier according
 	// to the memory model, so nothing may be ordered around it. Since
@@ -396,6 +417,13 @@ func (m *Manager) Fork() *Manager {
 	}
 }
 
+func (m *Manager) KeyMatch(w *Waiter) bool {
+	if w.key.Kind == KindPrivate {
+		return true
+	}
+	return false
+}
+
 // lockBucket returns a locked bucket for the given key.
 func (m *Manager) lockBucket(k *Key) *bucket {
 	var b *bucket
@@ -452,6 +480,9 @@ func (m *Manager) Wake(t Target, addr hostarch.Addr, private bool, bitmask uint3
 	// This function is very hot; avoid defer.
 	k, err := getKey(t, addr, private)
 	if err != nil {
+		if locked {
+			b.mu.Unlock()
+		}
 		return 0, err
 	}
 
@@ -553,7 +584,7 @@ func (m *Manager) WakeOp(t Target, addr1, addr2 hostarch.Addr, private bool, nwa
 // enqueues w to be woken by a send to w.C. If WaitPrepare returns nil, the
 // Waiter must be subsequently removed by calling WaitComplete, whether or not
 // a wakeup is received on w.C.
-func (m *Manager) WaitPrepare(w *Waiter, t Target, addr hostarch.Addr, private bool, val uint32, bitmask uint32) error {
+func (m *Manager) WaitPrepare(w *Waiter, t Target, addr usermem.Addr, private bool, val uint32, bitmask uint32, forever bool) error {
 	k, err := getKey(t, addr, private)
 	if err != nil {
 		return err
@@ -561,14 +592,22 @@ func (m *Manager) WaitPrepare(w *Waiter, t Target, addr hostarch.Addr, private b
 	// Ownership of k is transferred to w below.
 
 	// Prepare the Waiter before taking the bucket lock.
-	select {
-	case <-w.C:
-	default:
+	if !private || !forever {
+		select {
+		case <-w.C:
+		default:
+		}
 	}
 	w.key = k
 	w.bitmask = bitmask
 
 	b := m.lockBucket(&k)
+	if private {
+		w.Forever = forever
+	} else {
+		w.Forever = false
+	}
+	runtime.ClearGStatus()
 	// This function is very hot; avoid defer.
 
 	// Perform our atomic check.
@@ -578,6 +617,7 @@ func (m *Manager) WaitPrepare(w *Waiter, t Target, addr hostarch.Addr, private b
 		return err
 	}
 
+	w.Woken = false
 	// Add the waiter to the bucket.
 	b.waiters.PushBack(w)
 	w.bucket.Store(b)
@@ -793,6 +833,6 @@ func (m *Manager) unlockPILocked(t Target, addr hostarch.Addr, tid uint32, b *bu
 		return syserror.EINVAL
 	}
 
-	b.wakeWaiterLocked(next)
+	b.wakeWaiterLocked(next, -1)
 	return nil
 }
