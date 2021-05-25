@@ -692,6 +692,63 @@ TEST_P(SocketInetLoopbackTest, TCPListenShutdownConnectingRead) {
   });
 }
 
+// Test close of a non-blocking connecting socket.
+TEST_P(SocketInetLoopbackTest, TCPNonBlockingConnectClose) {
+  auto const& param = GetParam();
+  TestAddress const& listener = param.listener;
+  TestAddress const& connector = param.connector;
+
+  // Create the listening socket.
+  FileDescriptor listen_fd = ASSERT_NO_ERRNO_AND_VALUE(
+      Socket(listener.family(), SOCK_STREAM | SOCK_NONBLOCK, IPPROTO_TCP));
+  sockaddr_storage listen_addr = listener.addr;
+  ASSERT_THAT(
+      bind(listen_fd.get(), AsSockAddr(&listen_addr), listener.addr_len),
+      SyscallSucceeds());
+  constexpr int kBacklog = 0;
+  ASSERT_THAT(listen(listen_fd.get(), kBacklog), SyscallSucceeds());
+
+  // Get the port bound by the listening socket.
+  socklen_t addrlen = listener.addr_len;
+  ASSERT_THAT(getsockname(listen_fd.get(), AsSockAddr(&listen_addr), &addrlen),
+              SyscallSucceeds());
+  uint16_t const port =
+      ASSERT_NO_ERRNO_AND_VALUE(AddrPort(listener.family(), listen_addr));
+
+  sockaddr_storage conn_addr = connector.addr;
+  ASSERT_NO_ERRNO(SetAddrPort(connector.family(), &conn_addr, port));
+
+  // Try many iterations to catch a race with socket close and handshake
+  // completion.
+  for (int i = 0; i < 1000; i++) {
+    FileDescriptor client = ASSERT_NO_ERRNO_AND_VALUE(
+        Socket(connector.family(), SOCK_STREAM | SOCK_NONBLOCK, IPPROTO_TCP));
+    ASSERT_THAT(
+        connect(client.get(), AsSockAddr(&conn_addr), connector.addr_len),
+        SyscallFailsWithErrno(EINPROGRESS));
+    ASSERT_THAT(close(client.release()), SyscallSucceeds());
+
+    auto accepted = FileDescriptor(accept(listen_fd.get(), nullptr, nullptr));
+    if (accepted.get() > 0) {
+      struct pollfd pfd = {
+          .fd = accepted.get(),
+          .events = POLLIN | POLLRDHUP,
+      };
+      constexpr int kTimeout = 10000;
+      int n = poll(&pfd, 1, kTimeout);
+      ASSERT_GE(n, 0) << strerror(errno);
+      ASSERT_EQ(n, 1);
+      if (IsRunningOnGvisor()) {
+        // TODO(gvisor.dev/issue/6015): Notify POLLRDHUP on incoming FIN.
+        ASSERT_EQ(pfd.revents, POLLIN);
+      } else {
+        ASSERT_EQ(pfd.revents, POLLIN | POLLRDHUP);
+      }
+      ASSERT_THAT(close(accepted.release()), SyscallSucceeds());
+    }
+  }
+}
+
 // TODO(b/157236388): Remove  once bug is fixed. Test fails w/
 // random save as established connections which can't be delivered to the accept
 // queue because the queue is full are not correctly delivered after restore
